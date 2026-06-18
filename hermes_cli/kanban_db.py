@@ -100,6 +100,23 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def _validate_workspace_kind(workspace_kind: str) -> None:
+    """Raise ``ValueError`` if ``workspace_kind`` is not a recognized kind.
+
+    Shared by EVERY create path (single-card ``create_task`` and the
+    decomposition fan-out ``decompose_triage_task``) so an invalid kind fails
+    loudly at create time instead of being accepted and silently auto-blocking
+    the card when the dispatcher later fails to materialize its workspace at
+    spawn.
+    """
+    if workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r} (use 'dir' + workspace_path for an "
+            f"existing repo; a board slug or project name is not a kind)"
+        )
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -2104,11 +2121,7 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
-        )
+    _validate_workspace_kind(workspace_kind)
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -4506,6 +4519,7 @@ def decompose_triage_task(
             # child can't accidentally point a 'dir' at the root's
             # worktree path or vice versa).
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
+            _validate_workspace_kind(child_ws_kind)
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
             elif child_ws_kind == root_ws_kind:
