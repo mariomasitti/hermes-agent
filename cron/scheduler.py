@@ -1755,6 +1755,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        agent._request_priority = "batch"  # cluster router: don't evict live slot
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -1783,6 +1784,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
+        # Mark this cron context batch-priority so its auxiliary LLM calls
+        # (web extraction, summaries) don't evict the live interactive slot.
+        try:
+            from agent.auxiliary_client import _aux_request_priority as _aux_prio
+            _cron_context.run(_aux_prio.set, "batch")
+        except Exception:
+            pass
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:

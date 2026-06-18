@@ -1891,6 +1891,21 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Secondary (overflow) delegation — when set, subagents try this
+        # provider:model pair first. If the endpoint is healthy, child agents
+        # run on secondary. If the health check fails (timeout or error),
+        # delegation falls back to the primary delegation config above (or
+        # inherits from the parent agent if that is also empty).
+        # This lets you offload heavy subagent work to a faster remote model
+        # while keeping local hardware for interactive chat.
+        "secondary": {
+            "enabled": False,     # off by default — set to True to activate
+            "provider": "",       # e.g. "openrouter", "custom"
+            "base_url": "",       # e.g. "http://172.19.10.119:11436/v1"
+            "model": "",          # e.g. "qwen3.6-hermes:35b-a3b-ud-q4_K_XL"
+            "api_key": "",        # optional — empty = inherit parent key
+            "health_check_timeout": 5,  # seconds to wait for a /v1/models ping
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

@@ -534,6 +534,7 @@ def _run_review_in_thread(
                 skip_memory=True,
             )
             review_agent._memory_write_origin = "background_review"
+            review_agent._request_priority = "batch"  # cluster router: don't evict live slot
             review_agent._memory_write_context = "background_review"
             review_agent._memory_store = agent._memory_store
             review_agent._memory_enabled = agent._memory_enabled

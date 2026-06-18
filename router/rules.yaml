@@ -1,0 +1,34 @@
+# HERMES-ROUTER-001 routing rules (thresholds are starting guesses, tuned in Phase 5).
+defaults:
+  first_probe: hermes
+  self_grade_threshold: 0.6
+models:           # tier -> model (kept in step with fleet.db `services`)
+  hermes: qwen-3.6-35b
+  codex:  gpt-5.4-mini
+  claude: claude-sonnet
+task_types:
+  code_gen:  { escalates_to: codex,  threshold: 0.6, verifier: deterministic }
+  bug_fix:   { escalates_to: codex,  threshold: 0.6, verifier: deterministic }
+  refactor:  { escalates_to: codex,  threshold: 0.6, verifier: deterministic }
+  scripting: { escalates_to: codex,  threshold: 0.5, verifier: deterministic }
+  ops:       { escalates_to: codex,  threshold: 0.5, verifier: deterministic }
+  review:    { escalates_to: claude, threshold: 0.7, verifier: judge, high_stakes_eager: true }
+  design:    { escalates_to: claude, threshold: 0.7, verifier: judge }
+  planning:  { escalates_to: claude, threshold: 0.7, verifier: judge }
+  research:  { escalates_to: claude, threshold: 0.7, verifier: judge }
+  qa:        { escalates_to: claude, threshold: 0.7, verifier: judge }
+  security:  { escalates_to: claude, threshold: 1.0, verifier: judge, always_escalate: true }
+  _default:  { escalates_to: codex,  threshold: 0.6, verifier: judge }
+  ui_change: { escalates_to: codex, threshold: 0.6, verifier: visual, eyes_required: true, escalation_blind: true }
+  chart_viz: { escalates_to: codex, threshold: 0.6, verifier: visual, eyes_required: true, escalation_blind: true }
+  runtime_check: { escalates_to: codex, threshold: 0.6, verifier: visual, eyes_required: true, escalation_blind: true }
+autonomy:
+  codex:  { gate: none }
+  claude: { auto_if_cost_under: 0.50, day_cap_usd: 20.0, hard_stop_usd: 90.0 }
+  force_approval_high_stakes: true   # high-stakes/security always gated, regardless of cost
+guards:
+  max_escalations_per_task: 1
+  max_usd_per_task: 5.0
+  max_escalations_per_hour: 30
+  max_wall_clock_per_task_s: 600        # Phase 4: runaway wall-clock guard (10 min/task)
+  est_cloud_call_usd: 0.02              # equivalent/estimated $ per cloud call (OAuth is flat-rate; for the day-spend estimate only)

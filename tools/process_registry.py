@@ -98,6 +98,8 @@ class ProcessSession:
     env_ref: Any = None                         # Reference to the environment object
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn
+    last_output_at: float = 0.0                 # time.time() of last output chunk (Phase 3 heartbeat; 0 => none yet)
+    max_silence: float = 0.0                    # Phase 3: largest gap (s) between consecutive outputs (=> ever_stalled)
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -191,6 +193,110 @@ class ProcessRegistry:
             lines.pop(0)
         return "\n".join(lines)
 
+    # ----- Phase 3: progress heartbeat (recommend-only; never auto-kills) -----
+    # Per-class (quiet, stall) thresholds in seconds. "quiet" = no output but likely
+    # still healthy; "stalled" = silent long enough to be worth a human look. Servers
+    # are long-lived and legitimately silent, so they are effectively never "stalled".
+    _PROC_CLASSES = {
+        "server":  (10 ** 9, 10 ** 9),
+        "install": (120, 420),
+        "build":   (90, 300),
+        "test":    (60, 180),
+        "generic": (45, 150),
+    }
+
+    @staticmethod
+    def _classify(command: str) -> str:
+        """Heuristic process class from the command (recommend-only — a misclass only
+        shifts thresholds, it can never kill anything)."""
+        c = (command or "").lower()
+        if any(k in c for k in ("npm run dev", "npm start", "yarn dev", "pnpm dev", "uvicorn",
+                                "gunicorn", "flask run", "next dev", "http.server", "runserver",
+                                "serve")) or ("vite" in c and "vite build" not in c):
+            return "server"
+        if any(k in c for k in ("pip install", "pip3 install", "poetry install", "npm install",
+                                "npm ci", "yarn install", "yarn add", "pnpm install", "apt-get",
+                                "apt ", "brew install", "cargo fetch", "go mod", "go get",
+                                "bundle install")):
+            return "install"
+        if any(k in c for k in ("npm run build", "yarn build", "pnpm build", "webpack", "rollup",
+                                "esbuild", "tsc", "vite build", "cargo build", "gradle", "mvn",
+                                "docker build", "make", "cmake")):
+            return "build"
+        if any(k in c for k in ("pytest", "jest", "vitest", "go test", "cargo test", "npm test",
+                                "yarn test", "pnpm test", "unittest", "tox")):
+            return "test"
+        return "generic"
+
+    def progress(self, session: "ProcessSession") -> dict:
+        """Read-only progress signal for a tracked process. No side effects, no I/O.
+        state ∈ {advancing, quiet, stalled, exited}; idle measured from the last output
+        (or spawn, before any output)."""
+        proc_class = self._classify(session.command)
+        if session.exited:
+            return {"state": "exited", "idle_seconds": 0, "proc_class": proc_class,
+                    "saw_output": bool(session.last_output_at)}
+        quiet_t, stall_t = self._PROC_CLASSES.get(proc_class, self._PROC_CLASSES["generic"])
+        ref = session.last_output_at or session.started_at
+        idle = max(0, int(time.time() - ref)) if ref else 0
+        state = "stalled" if idle >= stall_t else ("quiet" if idle >= quiet_t else "advancing")
+        return {"state": state, "idle_seconds": idle, "proc_class": proc_class,
+                "saw_output": bool(session.last_output_at)}
+
+    def recommend(self, task_id: str = None) -> list:
+        """Recommend-only: surface running processes that look stalled. NEVER kills.
+        (Auto-kill is intentionally not implemented; that would be a separate, gated change.)"""
+        with self._lock:
+            running = list(self._running.values())
+        recs = []
+        for s in running:
+            if (task_id and s.task_id != task_id) or s.exited:
+                continue
+            p = self.progress(s)
+            if p["state"] == "stalled":
+                recs.append({
+                    "session_id": s.id,
+                    "command": s.command[:120],
+                    "proc_class": p["proc_class"],
+                    "idle_seconds": p["idle_seconds"],
+                    "recommendation": (f"No output for {p['idle_seconds']}s "
+                                       f"(class={p['proc_class']}); investigate or kill_process('{s.id}')."),
+                    "action": "kill_suggested",
+                })
+        return recs
+
+    def _record_finished_process(self, session: "ProcessSession") -> None:
+        """Phase 3 (3B): append one row per finished process to fleet.db `processes`
+        — the auditable 'stuck' ledger (how long it ran, did it ever go stalled). Runs
+        in-process (in the singleton). Best-effort & FULLY guarded: a DB hiccup must
+        never affect process management. Kill-switch: env HERMES_PROC_LEDGER=0."""
+        if os.getenv("HERMES_PROC_LEDGER", "1") != "1":
+            return
+        try:
+            import sqlite3
+            proc_class = self._classify(session.command)
+            stall_t = self._PROC_CLASSES.get(proc_class, self._PROC_CLASSES["generic"])[1]
+            ended = time.time()
+            duration = max(0.0, ended - session.started_at) if session.started_at else 0.0
+            ever_stalled = 1 if session.max_silence >= stall_t else 0
+            con = sqlite3.connect(str(get_hermes_home() / "fleet.db"), timeout=2.0)
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS processes ("
+                    "id TEXT PRIMARY KEY, command TEXT, proc_class TEXT, task_id TEXT, "
+                    "started_at REAL, ended_at REAL, duration_s REAL, exit_code INTEGER, "
+                    "max_silence_s REAL, stall_threshold_s INTEGER, ever_stalled INTEGER, recorded_at REAL)")
+                con.execute(
+                    "INSERT OR REPLACE INTO processes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (session.id, (session.command or "")[:500], proc_class, session.task_id,
+                     session.started_at, ended, round(duration, 2), session.exit_code,
+                     round(session.max_silence, 2), int(stall_t), ever_stalled, ended))
+                con.commit()
+            finally:
+                con.close()
+        except Exception as e:
+            logger.debug("processes ledger write skipped: %s", e)
+
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
 
@@ -204,6 +310,16 @@ class ProcessRegistry:
         notify_on_complete semantics — one notification when the process
         actually exits, no more mid-process spam.
         """
+        # Phase 3 heartbeat: this is the single chokepoint that every reader backend
+        # (pipe/PTY/env-poller) calls on each new output chunk. Stamp it here, before
+        # any watch-pattern early-return, so progress() works regardless of whether
+        # watch_patterns is configured. Purely additive — does not affect watch logic.
+        _now_hb = time.time()
+        if session.last_output_at:
+            _gap = _now_hb - session.last_output_at
+            if _gap > session.max_silence:
+                session.max_silence = _gap
+        session.last_output_at = _now_hb
         if not session.watch_patterns or session._watch_disabled:
             return
         # Suppress-after-exit: once the reader loop has declared the process
@@ -888,6 +1004,10 @@ class ProcessRegistry:
         session._completion_event.set()
         self._write_checkpoint()
 
+        # Phase 3 (3B): record the lifecycle row exactly once, on the first move.
+        if was_running:
+            self._record_finished_process(session)
+
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
@@ -1033,6 +1153,7 @@ class ProcessRegistry:
             "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
+            "progress": self.progress(session),
         }
         if session.exited:
             result["exit_code"] = session.exit_code
@@ -1152,6 +1273,7 @@ class ProcessRegistry:
         result = {
             "status": "timeout",
             "output": strip_ansi(session.output_buffer[-1000:]),
+            "progress": self.progress(session),
         }
         if timeout_note:
             result["timeout_note"] = timeout_note
@@ -1328,6 +1450,7 @@ class ProcessRegistry:
                 "uptime_seconds": int(time.time() - s.started_at),
                 "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+                "progress": self.progress(s),
             }
             if s.exited:
                 entry["exit_code"] = s.exit_code

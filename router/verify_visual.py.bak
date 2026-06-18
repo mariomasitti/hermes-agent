@@ -1,0 +1,36 @@
+"""Phase 1: two-rail visual verdict.
+RAIL 1 (deterministic: console/http/non-blank/DOM-selectors) short-circuits to FAIL-with-reason.
+RAIL 2 (Qwen-VL perceptual) adjudicates 'looks right' — only weighted when RAIL 1 passes.
+"""
+from __future__ import annotations
+from . import sight, sight_probe
+
+
+def verify(url, viewport, expectation, dom_assertions=None, wait_selector=None, run_vision=True):
+    ev = sight.capture(url, viewport, dom_assertions, wait_selector)
+    checks = [{"name": "console_errors", "passed": len(ev.console_errors) == 0,
+               "detail": f"{len(ev.console_errors)} errors"}]
+    if ev.http_status is not None:
+        checks.append({"name": "http_2xx", "passed": 200 <= ev.http_status < 300,
+                       "detail": f"status {ev.http_status}"})
+    checks.append({"name": "resource_loads", "passed": len(ev.failed_requests) == 0,
+                   "detail": f"{len(ev.failed_requests)} failed: {ev.failed_requests[:2]}"})
+    checks.append({"name": "non_blank", "passed": ev.pixel_variance > 2.0,
+                   "detail": f"variance {ev.pixel_variance:.1f}"})
+    checks.extend(ev.dom_checks)
+    rail1 = all(c["passed"] for c in checks)
+    out = {"rail1_pass": rail1, "checks": checks, "evidence": ev,
+           "vision": None, "render_pass": rail1, "method": "visual-deterministic"}
+    if run_vision:
+        sg = sight_probe.vision_grade(ev.jpeg_b64, expectation)
+        vp = sg.checks_run[0]["passed"]
+        out["vision"] = {"render_pass": vp, "confidence": sg.confidence, "issues": sg.uncertainties}
+        out["method"] = "visual"
+        out["render_pass"] = rail1 and vp
+    if not rail1:
+        out["reason"] = "RAIL1 FAIL: " + ", ".join(c["name"] for c in checks if not c["passed"])
+    elif out["vision"] and not out["vision"]["render_pass"]:
+        out["reason"] = f"RAIL1 ok but vision FAIL: {out['vision']['issues']}"
+    else:
+        out["reason"] = "PASS (deterministic + vision)"
+    return out

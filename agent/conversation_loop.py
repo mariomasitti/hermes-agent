@@ -1810,6 +1810,7 @@ def run_conversation(
                         agent.context_compressor._context_probe_persistable = False
 
                     agent.session_prompt_tokens += prompt_tokens
+                    agent._last_prompt_tokens = prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1

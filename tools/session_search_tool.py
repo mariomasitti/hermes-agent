@@ -31,6 +31,7 @@ support.
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
@@ -760,6 +761,90 @@ SESSION_SEARCH_SCHEMA = {
 }
 
 
+
+def _clamp_session_search_result(result):
+    """Bound session_search output so whole-session recall can't blow the
+    context window.
+
+    session_search can return tens of thousands of chars per call (whole-session
+    dumps, multi-session discovery). Left unbounded those refill the context
+    right after a compaction, producing a compact -> cold-prefill -> refill
+    treadmill (root-caused 2026-06-14). We truncate long message bodies and, if
+    still oversized, elide the middle of message lists -- every result slot, id,
+    title and snippet is preserved, so recall still works; use the SCROLL shape
+    to read any single message in full.
+
+    Tunables (env): HERMES_SESSION_SEARCH_MAX_CHARS (default 20000, 0 disables),
+    HERMES_SESSION_SEARCH_PER_MSG_CHARS (default 800).
+    """
+    try:
+        total_cap = int(os.getenv("HERMES_SESSION_SEARCH_MAX_CHARS", "20000"))
+    except (TypeError, ValueError):
+        total_cap = 20000
+    if total_cap <= 0 or not isinstance(result, str) or len(result) <= total_cap:
+        return result
+    try:
+        per_msg = int(os.getenv("HERMES_SESSION_SEARCH_PER_MSG_CHARS", "800"))
+    except (TypeError, ValueError):
+        per_msg = 800
+    try:
+        data = json.loads(result)
+    except Exception:
+        return result[:total_cap] + (
+            "\n...[session_search output truncated to protect the context "
+            "window; narrow the query/limit or use the SCROLL shape]"
+        )
+
+    stats = {"bodies": 0, "elided": 0}
+
+    def _walk(v):
+        if isinstance(v, str):
+            if per_msg > 0 and len(v) > per_msg:
+                stats["bodies"] += 1
+                return v[:per_msg] + "...[+%d chars]" % (len(v) - per_msg)
+            return v
+        if isinstance(v, list):
+            return [_walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _walk(x) for k, x in v.items()}
+        return v
+
+    data = _walk(data)
+
+    def _elide(v, keep):
+        if isinstance(v, list):
+            v = [_elide(x, keep) for x in v]
+            if len(v) > 2 * keep + 1:
+                dropped = len(v) - 2 * keep
+                stats["elided"] += dropped
+                return v[:keep] + [{"_elided_messages": dropped}] + v[-keep:]
+            return v
+        if isinstance(v, dict):
+            return {k: _elide(x, keep) for k, x in v.items()}
+        return v
+
+    out = json.dumps(data, ensure_ascii=False)
+    keep = 8
+    while len(out) > total_cap and keep >= 2:
+        data = _elide(data, keep)
+        out = json.dumps(data, ensure_ascii=False)
+        keep -= 2
+
+    if (stats["bodies"] or stats["elided"]) and isinstance(data, dict):
+        data["_truncated"] = {
+            "bodies_truncated": stats["bodies"],
+            "messages_elided": stats["elided"],
+            "note": ("Output capped to protect the context window. Use the SCROLL "
+                     "shape (session_id + around_message_id) to read any message "
+                     "in full, or narrow the query/limit."),
+        }
+        out = json.dumps(data, ensure_ascii=False)
+
+    if len(out) > total_cap:
+        out = out[:total_cap] + "\n...[truncated]"
+    return out
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -767,7 +852,7 @@ registry.register(
     name="session_search",
     toolset="session_search",
     schema=SESSION_SEARCH_SCHEMA,
-    handler=lambda args, **kw: session_search(
+    handler=lambda args, **kw: _clamp_session_search_result(session_search(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
@@ -778,7 +863,7 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
-    ),
+    )),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

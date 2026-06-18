@@ -2135,6 +2135,15 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    # A2.5a SHADOW (observe-only): log what the router WOULD decide for this real delegation.
+    # Fail-open + kill-switched (default OFF); does NOT change the model used below.
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        from router import shadow as _router_shadow
+        _router_shadow.shadow_log_tasks(goal=goal, tasks=tasks, role=role, config=cfg)
+    except Exception:
+        pass
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2648,8 +2657,96 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _health_check(base_url: str, api_key: str = None, timeout: float = 5.0) -> bool:
+    """Ping an OpenAI-compatible endpoint to verify it is reachable.
+
+    Step 1: Try ``GET /v1/models`` for a quick connectivity check.
+    Step 2: Always do a minimal chat completion warmup (5 tokens max)
+    to ensure the model is actually loaded — critical for llama.cpp
+    and Ollama which load models lazily on first real request.
+
+    The warmup retries up to 3 times with increasing delays to handle
+    cold-start model loading (which can take 10–30 s for 35B+ models).
+
+    Returns True only if BOTH the connectivity check and the warmup
+    succeed.  Returns False on persistent timeout, connection refused,
+    or malformed response.
+    """
+    import json
+    import time
+    import urllib.request
+    import urllib.error
+
+    base = base_url.rstrip("/")
+    # base_url may already include /v1 (e.g. http://host:port/v1)
+    if base.endswith("/v1"):
+        models_url = base + "/models"
+        chat_url = base + "/chat/completions"
+    else:
+        models_url = base + "/v1/models"
+        chat_url = base + "/v1/chat/completions"
+
+    # Step 1: Quick connectivity check via /v1/models
+    try:
+        req = urllib.request.Request(models_url, method="GET")
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            json.loads(body)  # must be valid JSON
+    except Exception:
+        pass  # won't matter — we do the warmup below anyway
+
+    # Step 2: Warmup chat completion with retry logic
+    # Cold-start: llama.cpp / Ollama load models lazily. A 35B model
+    # can take 10–30 s to load into memory.  We retry with escalating
+    # delays so a freshly-spawned subagent can wait for the model.
+    payload = json.dumps({
+        "model": "",  # empty — server picks default
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 5,
+        "stream": False,
+    }).encode("utf-8")
+
+    # Configurable warmup: up to 3 retries, 2s gap between attempts
+    # Total budget ≈ timeout * 2 + retries * gap  (gives generous cold-start room)
+    max_retries = 3
+    retry_gap = 2.0
+    warmup_timeout = max(timeout, 15.0)  # at least 15 s per attempt
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            time.sleep(retry_gap)
+        try:
+            req = urllib.request.Request(chat_url, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+            with urllib.request.urlopen(req, timeout=warmup_timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                json.loads(body)  # valid response = model is ready
+                return True
+        except (urllib.error.URLError, TimeoutError, ConnectionRefusedError):
+            # Connection refused / timeout — model may still be loading
+            continue
+        except Exception:
+            # Non-retryable error (bad JSON, 4xx, etc.)
+            return False
+
+    return False
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
+
+    If ``delegation.secondary.enabled`` is True, this function first
+    attempts a health check against the secondary endpoint. If the check
+    passes, secondary credentials are returned — child agents will run on
+    the secondary provider:model pair. If the check fails (timeout, error,
+    or malformed response), this falls through to the primary delegation
+    config (same behavior as before this feature).
+
+    Primary delegation config rules:
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -2669,6 +2766,44 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    # ── Secondary (overflow) delegation ─────────────────────────────
+    # When secondary is enabled, health-ping the endpoint first.
+    # If it responds, return secondary creds → child runs there.
+    # If it fails, fall through to the primary delegation config.
+    sec = cfg.get("secondary") or {}
+    if is_truthy_value(sec.get("enabled")):
+        sec_provider = str(sec.get("provider") or "").strip() or None
+        sec_base_url = str(sec.get("base_url") or "").strip() or None
+        sec_model = str(sec.get("model") or "").strip() or None
+        sec_api_key = str(sec.get("api_key") or "").strip() or None
+        sec_timeout = float(sec.get("health_check_timeout", 5))
+        if sec_base_url and sec_model:
+            if _health_check(sec_base_url, sec_api_key, sec_timeout):
+                logger.info(
+                    "delegation.secondary health check passed (%s), "
+                    "routing subagent to secondary model %s",
+                    sec_base_url, sec_model,
+                )
+                return {
+                    "model": sec_model,
+                    "provider": sec_provider or "custom",
+                    "base_url": sec_base_url,
+                    "api_key": sec_api_key or None,
+                    "api_mode": None,  # will be auto-detected by _build_child_agent
+                }
+            else:
+                logger.warning(
+                    "delegation.secondary health check failed (%s), "
+                    "falling back to primary delegation config",
+                    sec_base_url,
+                )
+        else:
+            logger.debug(
+                "delegation.secondary enabled but missing base_url or model; "
+                "skipping secondary, using primary config"
+            )
+
+    # ── Primary delegation config ───────────────────────────────────
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None

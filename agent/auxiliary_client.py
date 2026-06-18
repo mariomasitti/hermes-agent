@@ -103,6 +103,11 @@ from agent.credential_pool import load_pool
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from contextvars import ContextVar
+# Per-context auxiliary request priority. Set to 'batch' inside cron/bg
+# execution so those aux calls yield to (and spill off) the live
+# interactive KV slot on the cluster (cold-prefill freeze, 2026-06-14).
+_aux_request_priority = ContextVar("hermes_aux_priority", default="interactive")
 
 logger = logging.getLogger(__name__)
 
@@ -5063,6 +5068,20 @@ def _build_call_kwargs(
         "messages": messages,
         "timeout": timeout,
     }
+    # Background/cron aux calls -> batch priority so the cluster router
+    # holds them back (and spills them to the idle MacBook) instead of
+    # evicting the live interactive KV slot. Gated on the cron/bg context
+    # AND the custom cluster endpoint so the header never reaches provider
+    # shims that don't forward extra_headers.
+    try:
+        if _aux_request_priority.get() == "batch":
+            _eff_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
+            if base_url_host_matches(str(_eff_base or ""), "172.19.10.50"):
+                _eh = dict(kwargs.get("extra_headers") or {})
+                _eh.setdefault("X-MMS-Priority", "batch")
+                kwargs["extra_headers"] = _eh
+    except Exception:
+        pass
 
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:

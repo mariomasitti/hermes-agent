@@ -1437,6 +1437,26 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        # Defer background review on large contexts: the fork carries the
+        # full conversation, and above the spillover backend's per-slot ctx
+        # it can't spill -> pins to the controller and evicts the live
+        # interactive KV slot (cold-prefill freeze, 2026-06-14). Skip when
+        # oversized; learning resumes on smaller sessions. Env
+        # HERMES_BGREVIEW_MAX_CONTEXT_CHARS (default 210000 ~= 60k tokens;
+        # 0 disables the guard).
+        try:
+            _bgr_cap = int(os.environ.get("HERMES_BGREVIEW_MAX_CONTEXT_TOKENS", "60000"))
+        except (TypeError, ValueError):
+            _bgr_cap = 60000
+        if _bgr_cap > 0:
+            _bgr_tok = int(getattr(self, "_last_prompt_tokens", 0) or 0)
+            if _bgr_tok > _bgr_cap:
+                logger.info(
+                    "background review skipped: parent context ~%d tok > %d cap "
+                    "(can't spill to the small backend; would evict the live KV slot)",
+                    _bgr_tok, _bgr_cap,
+                )
+                return
         from agent.background_review import spawn_background_review_thread
         target, _prompt = spawn_background_review_thread(
             self,
@@ -3662,6 +3682,15 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+        # Background/cron turns route to the cluster as batch priority so the
+        # MMS router holds them back rather than evicting the live KV slot
+        # (cold-prefill freeze, root-caused 2026-06-14).
+        if getattr(self, "_request_priority", None) == "batch" and base_url_host_matches(
+            str(request_kwargs.get("base_url", "")), "172.19.10.50"
+        ):
+            _dh = dict(request_kwargs.get("default_headers") or {})
+            _dh.setdefault("X-MMS-Priority", "batch")
+            request_kwargs["default_headers"] = _dh
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
